@@ -1,0 +1,14 @@
+# Local credentials
+secrets.h
+
+# Arduino build output
+*.bin
+*.elf
+*.map
+build/
+
+# Editor junk
+.vscode/
+.idea/
+*.swp
+*~
