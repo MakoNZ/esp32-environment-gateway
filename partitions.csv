@@ -1,5 +1,5 @@
 # ESP32-C6 4 MiB dual-OTA layout for the environment gateway.,,,,,
-"# Two 0x1E0000 (1,966,080-byte) app slots retain OTA while allowing a much",,,,,
+# Two 0x1E0000 (1,966,080-byte) app slots retain OTA while allowing a much,,,,,
 # larger image than Arduino's default ~1.25 MiB OTA app slot.,,,,,
 # Name,     Type, SubType, Offset,   Size,      Flags
 nvs,        data, nvs,     0x9000,   0x5000,
