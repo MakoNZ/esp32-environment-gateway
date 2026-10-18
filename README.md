@@ -1,158 +1,179 @@
 # ESP32 Environment Gateway
 
-An ESP32-C6 based environmental sensor and Bluetooth gateway for use with
-Gladys Assistant and MQTT.
+A Seeed Studio XIAO ESP32-C6 environmental sensor and Bluetooth LE gateway for
+MQTT and Gladys Assistant. A wired BME280 provides local environmental readings;
+the gateway also receives unencrypted BTHome v2 advertisements from a Xiaomi Mi
+Temperature and Humidity Monitor 2 (LYWSD03MMC).
 
-The gateway combines a locally connected BME280 environmental sensor with
-passive Bluetooth LE monitoring of a Xiaomi Mi Temperature and Humidity
-Monitor 2 (LYWSD03MMC).
-
-Sensor data is published to an MQTT broker where it can be consumed by
-Gladys Assistant or other home automation software.
+The firmware supports retained MQTT values, per-topic change/heartbeat filtering,
+automatic Wi-Fi/MQTT reconnection, and password-protected ArduinoOTA firmware
+updates after the first USB installation.
 
 ## Hardware
 
-- Seeed Studio XIAO ESP32-C6
+- Seeed Studio XIAO ESP32-C6 (4 MiB flash)
 - BME280 temperature, humidity and pressure sensor
-- Xiaomi Mi Temperature and Humidity Monitor 2
-  - Model: LYWSD03MMC
-  - Custom firmware broadcasting unencrypted BTHome v2 advertisements
+- Xiaomi LYWSD03MMC running firmware that broadcasts **unencrypted BTHome v2**
+  measurements
 
-## BME280 Wiring
-
-The BME280 breakout used during development is a nominal 5 V module with an
-onboard regulator. It is powered from 3.3 V so that its I2C pull-ups also
-operate at ESP32-safe 3.3 V logic levels.
+### BME280 wiring
 
 | BME280 | XIAO ESP32-C6 |
-|--------|----------------|
-| VIN    | 3V3            |
-| GND    | GND            |
-| SDA    | D4 / GPIO22    |
-| SCL    | D5 / GPIO23    |
+| --- | --- |
+| VIN | 3V3 |
+| GND | GND |
+| SDA | D4 / GPIO22 |
+| SCL | D5 / GPIO23 |
 
-The BME280 used during development responds at I2C address `0x76`.
+The development BME280 breakout is a nominal 5 V module with an onboard
+regulator. It is supplied at **3.3 V** so its I2C pull-ups are also at
+ESP32-safe levels. The sketch expects I2C address `0x76`.
 
-## Features
+## Software requirements
 
-- BME280 temperature monitoring
-- BME280 humidity monitoring
-- BME280 atmospheric pressure monitoring
-- Passive Bluetooth LE scanning
-- BTHome v2 decoding
-- Xiaomi LYWSD03MMC temperature monitoring
-- Xiaomi LYWSD03MMC humidity monitoring
-- Xiaomi battery monitoring
-- Xiaomi BLE RSSI monitoring
-- MQTT retained sensor values
-- MQTT gateway availability
-- Xiaomi sensor availability detection
-- Automatic Wi-Fi and MQTT reconnection
-- Continuous BLE scanning with duplicate packet suppression
-- Serial diagnostic output
+The tested setup uses Arduino IDE with **Espressif ESP32 Arduino core 3.3.12**
+and board **Seeed Studio XIAO ESP32C6** (`esp32:esp32:XIAO_ESP32C6`).
 
-## MQTT Topics
+Install these Arduino libraries:
 
-### Gateway
+- Adafruit BME280 Library (tested with 2.3.0)
+- Adafruit Unified Sensor (1.1.15)
+- Adafruit BusIO (1.17.4)
+- PubSubClient (2.8)
+- NimBLE-Arduino (2.5.1)
 
-```text
-home/environment/environment-sensor-1/status
+`Wire`, `WiFi` and `ArduinoOTA` come from the ESP32 board package.
+
+## Configuration and initial USB installation
+
+1. Copy `secrets.h.example` to `secrets.h` alongside the sketch.
+2. Set the Wi-Fi and MQTT connection details and a strong, unique
+   `OTA_PASSWORD`. An empty password disables OTA; do not leave the
+   example placeholder as your real password.
+3. Open `esp32-environment-gateway.ino` in Arduino IDE and select the XIAO
+   ESP32-C6 board.
+4. Keep the project's **`partitions.csv` in the sketch directory**.
+   Arduino's build process copies this custom layout over the board's
+   partition-scheme preset. In the verified setup the FQBN printed
+   `PartitionScheme=huge_app`, but the build log explicitly copied the
+   sketch-local `partitions.csv`. Check that line in verbose build output.
+5. Perform the **first flash by USB**, which installs the dual OTA partition
+   table and OTA-enabled firmware. Verify Wi-Fi, MQTT, the BME280 and Xiaomi
+   readings before relying on future wireless uploads.
+
+`secrets.h` is ignored by Git. Check before any commit:
+
+```bash
+git check-ignore -v secrets.h
+git ls-files --error-unmatch secrets.h  # should report that it is not tracked
+git status --short
 ```
 
-### BME280
+Never commit real Wi-Fi, MQTT or OTA credentials. The example file contains
+placeholders only.
 
-```text
-home/environment/environment-sensor-1/bme280/temperature
-home/environment/environment-sensor-1/bme280/humidity
-home/environment/environment-sensor-1/bme280/pressure
-```
+## MQTT topics
 
-### Xiaomi LYWSD03MMC
+The default device name and topic prefix are set in the sketch as
+`environment-sensor-1` and `home/environment/environment-sensor-1`.
 
-```text
-home/environment/environment-sensor-1/xiaomi/status
-home/environment/environment-sensor-1/xiaomi/temperature
-home/environment/environment-sensor-1/xiaomi/humidity
-home/environment/environment-sensor-1/xiaomi/battery
-home/environment/environment-sensor-1/xiaomi/rssi
-```
+| Device | Metric | Topic suffix |
+| --- | --- | --- |
+| Gateway | Availability | `status` |
+| BME280 | Temperature | `bme280/temperature` |
+| BME280 | Humidity | `bme280/humidity` |
+| BME280 | Pressure | `bme280/pressure` |
+| Xiaomi | Availability | `xiaomi/status` |
+| Xiaomi | Temperature | `xiaomi/temperature` |
+| Xiaomi | Humidity | `xiaomi/humidity` |
+| Xiaomi | Battery percentage | `xiaomi/battery` |
+| Xiaomi | Battery voltage, when advertised | `xiaomi/battery_voltage` |
+| Xiaomi | BLE signal strength | `xiaomi/rssi` |
 
-## Xiaomi Sensor
+Sensor readings are retained in MQTT. Availability is also published using
+the gateway's status and Xiaomi status topics.
 
-The Xiaomi LYWSD03MMC uses custom firmware configured to transmit
-unencrypted BTHome v2 advertisements.
+### Sensor publishing policy
 
-The gateway listens for service UUID:
+The BME280 is sampled every **30 seconds**. Xiaomi measurements are decoded
+from passive BLE advertisements (service UUID `0xFCD2`) with packet-ID
+deduplication. The ESP32 does not connect to the Xiaomi device over BLE.
 
-```text
-0xFCD2
-```
+Each metric has its own last-published value and heartbeat timer:
 
-The ESP32 does not establish a Bluetooth connection to the sensor.
-Measurements are received entirely from passive BLE advertisements.
+| Reading | Publish when changed by | Heartbeat |
+| --- | --- | --- |
+| BME280 temperature | 0.1 °C | 5 minutes |
+| BME280 humidity | 1 % RH | 5 minutes |
+| BME280 pressure | 0.5 hPa | 5 minutes |
+| Xiaomi temperature | 0.1 °C | 5 minutes |
+| Xiaomi humidity | 1 % RH | 5 minutes |
+| Xiaomi battery percentage | 1 percentage point | 60 minutes |
+| Xiaomi battery voltage | 0.05 V | 60 minutes |
+| Xiaomi RSSI | No change threshold; periodic only | 5 minutes |
 
-## Arduino Libraries
+Heartbeats require an available reading and, for Xiaomi, continuing
+advertisements. The gateway cannot publish a fresh reading from a sensor it
+hasn't heard from. A reading is recorded as published only after the MQTT
+publish succeeds; reconnecting forces cached readings to be republished.
+Xiaomi online/offline availability is not subject to the measurement filters.
+The Xiaomi becomes unavailable after approximately five minutes without a
+valid advertisement.
 
-The sketch requires:
+Serial output reports BME280 samples and reports detailed Xiaomi measurements
+when at least one Xiaomi MQTT metric is published, rather than for each BLE
+advertisement.
 
-- Adafruit BME280 Library
-- Adafruit Unified Sensor
-- Adafruit BusIO
-- PubSubClient
-- NimBLE-Arduino
+## Wireless firmware updates (ArduinoOTA)
 
-The ESP32 Arduino core provides Wi-Fi, Wire and FreeRTOS support.
+ArduinoOTA must first be installed by USB using the dual-slot partition layout.
+Subsequent updates can be uploaded from Arduino IDE through its **network
+port**, for example `environment-sensor-1` at the device's LAN IP.
 
-## Configuration
+The tested setup successfully completed a wireless upload while the XIAO was
+powered from a separate USB power supply, without any USB data connection.
+ArduinoOTA uses:
 
-Copy:
+| Purpose | Protocol / port |
+| --- | --- |
+| Network-port discovery (mDNS) | UDP 5353 |
+| OTA invitation and authentication | **UDP 3232** on the ESP32 |
+| Firmware transfer callback | **TCP 3233** on the uploading computer (tested local uploader setting) |
 
-```text
-secrets.h.example
-```
+**Important for ESP32 Arduino core 3.3.12:** The tested XIAO needed a
+one-line **local ArduinoOTA IPv4 socket workaround** before reliable OTA
+responses were possible. That patch is applied to the installed board
+package on the compiling computer, **not** to this repository. Board-package
+updates may overwrite it. On the tested Arch Linux laptop, firewalld also
+needed a LAN-scoped rule for mDNS replies to ephemeral UDP ports.
 
-to:
+See **[docs/ARDUINO_OTA.md](docs/ARDUINO_OTA.md)** for the precise core patch,
+firewalld configuration, IDE upload override used during testing, and
+troubleshooting. Recheck whether the upstream issue is fixed before applying
+the workaround to future core versions.
 
-```text
-secrets.h
-```
-
-and configure the local Wi-Fi and MQTT credentials.
-
-`secrets.h` is excluded from Git and must not be committed.
+If USB is plugged into a computer but serial output is not being read, the
+gateway was observed to respond inconsistently to OTA invitations. Draining
+the USB serial stream, or powering the gateway without a USB data connection,
+coincided with reliable OTA uploads. USB serial backpressure is a possible
+explanation, not a confirmed root cause.
 
 ## Gladys Assistant
 
-The MQTT values can be exposed in Gladys as two logical devices.
+Create logical devices using the MQTT topics above:
 
-### BME280 Environment Sensor
+- **BME280:** temperature, humidity, pressure
+- **Xiaomi LYWSD03MMC:** temperature, humidity, battery, RSSI, and optional
+  battery voltage when transmitted by the sensor firmware
 
-- Temperature
-- Humidity
-- Pressure
+## Flash partition layout
 
-### Xiaomi Mi Temperature and Humidity Monitor 2
-
-- Temperature
-- Humidity
-- Battery
-- RSSI
-
-RSSI is intentionally retained as a sensor because graphs of radio signal
-strength are, apparently, a perfectly legitimate form of entertainment.
-
-## Flash Partition Layout
-
-The project includes a custom `partitions.csv` for the XIAO ESP32-C6's
-4 MiB flash.
-
-It provides two 1,966,080-byte application partitions, retaining OTA support
-while allowing a substantially larger firmware image than the default
-Arduino OTA partition layout.
-
-The current firmware does not yet implement OTA updating, but the partition
-layout allows OTA support to be added later without repartitioning the device.
+The sketch-local `partitions.csv` targets the XIAO ESP32-C6's 4 MiB flash and
+provides **two 1,966,080-byte application slots** (`app0` and `app1`).
+The layout supports OTA while allowing a larger application image than the
+default small-OTA partition layout. Changing the partition layout later
+requires care and may require another USB flash.
 
 ## License
 
-See `LICENSE`.
+See [LICENSE](LICENSE).

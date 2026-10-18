@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <ArduinoOTA.h>
 #include <PubSubClient.h>
 #include <NimBLEDevice.h>
 
@@ -30,6 +31,16 @@ static constexpr uint8_t I2C_SCL_PIN = D5;
 static constexpr uint8_t SENSOR_I2C_ADDRESS = 0x76;
 
 static constexpr uint32_t BME_READ_INTERVAL_MS = 30000;
+
+// Continue sampling every 30 seconds, but limit MQTT writes.
+// 0 change threshold means periodic-only reporting (used for RSSI).
+static constexpr uint32_t SENSOR_HEARTBEAT_MS = 5UL * 60UL * 1000UL;
+static constexpr uint32_t BATTERY_HEARTBEAT_MS = 60UL * 60UL * 1000UL;
+
+static constexpr float TEMPERATURE_CHANGE_C = 0.1F;
+static constexpr float HUMIDITY_CHANGE_PERCENT = 1.0F;
+static constexpr float PRESSURE_CHANGE_HPA = 0.5F;
+static constexpr float BATTERY_VOLTAGE_CHANGE_V = 0.05F;
 
 
 // =============================================================================
@@ -191,6 +202,19 @@ NimBLEScan *bleScan = nullptr;
 
 QueueHandle_t xiaomiQueue = nullptr;
 
+// Last successfully published values and their timestamps, tracked per topic.
+// Reading new sensor data never resets these publication checkpoints.
+struct PublishState
+{
+    bool valid = false;
+    double value = 0.0;
+    uint32_t atMs = 0;
+};
+
+PublishState bmeTemperatureSent, bmeHumiditySent, bmePressureSent;
+PublishState xiaomiTemperatureSent, xiaomiHumiditySent;
+PublishState xiaomiBatterySent, xiaomiBatteryVoltageSent, xiaomiRssiSent;
+
 
 // =============================================================================
 // STATE
@@ -212,6 +236,7 @@ bool haveBmeReading = false;
 
 uint32_t lastWifiAttemptTime = 0;
 bool wifiWasConnected = false;
+bool otaStarted = false;
 
 
 // -----------------------------------------------------------------------------
@@ -722,104 +747,192 @@ bool mqttPublishInt(
 
 
 // =============================================================================
+// MQTT CHANGE FILTERS
+// =============================================================================
+
+// Periodic-only topics use a minimum change threshold of zero.
+bool publishDue(
+    const PublishState &state,
+    double value,
+    double minChange,
+    uint32_t heartbeatMs,
+    bool force
+)
+{
+    return force ||
+        !state.valid ||
+        (minChange > 0.0 && fabs(value - state.value) >= minChange) ||
+        static_cast<uint32_t>(millis() - state.atMs) >= heartbeatMs;
+}
+
+void notePublished(PublishState &state, double value)
+{
+    state.value = value;
+    state.atMs = millis();
+    state.valid = true;
+}
+
+// A skipped update is successful; a failed publish is NOT recorded so it
+// will be retried with a later reading. Reconnection forces a full refresh.
+bool publishFloatFiltered(
+    const char *topic,
+    float value,
+    double minChange,
+    uint32_t heartbeatMs,
+    PublishState &state,
+    bool force,
+    bool &sent,
+    uint8_t decimals = 2
+)
+{
+    if (!publishDue(state, value, minChange, heartbeatMs, force))
+        return true;
+
+    if (!mqttPublishFloat(topic, value, decimals))
+        return false;
+
+    notePublished(state, value);
+    sent = true;
+    return true;
+}
+
+bool publishUIntFiltered(
+    const char *topic,
+    uint32_t value,
+    double minChange,
+    uint32_t heartbeatMs,
+    PublishState &state,
+    bool force,
+    bool &sent
+)
+{
+    if (!publishDue(state, value, minChange, heartbeatMs, force))
+        return true;
+
+    if (!mqttPublishUInt(topic, value))
+        return false;
+
+    notePublished(state, value);
+    sent = true;
+    return true;
+}
+
+bool publishIntFiltered(
+    const char *topic,
+    int32_t value,
+    double minChange,
+    uint32_t heartbeatMs,
+    PublishState &state,
+    bool force,
+    bool &sent
+)
+{
+    if (!publishDue(state, value, minChange, heartbeatMs, force))
+        return true;
+
+    if (!mqttPublishInt(topic, value))
+        return false;
+
+    notePublished(state, value);
+    sent = true;
+    return true;
+}
+
+
+// =============================================================================
 // MQTT SENSOR PUBLISHING
 // =============================================================================
 
 void publishBmeReading(
-    const EnvironmentReading &reading
+    const EnvironmentReading &reading,
+    bool force = false
 )
 {
     if (!mqttClient.connected())
-    {
         return;
-    }
 
     bool ok = true;
+    bool sent = false;
 
-    ok &= mqttPublishFloat(
-        MQTT_BME_TEMPERATURE_TOPIC,
-        reading.temperatureC
+    ok &= publishFloatFiltered(
+        MQTT_BME_TEMPERATURE_TOPIC, reading.temperatureC,
+        TEMPERATURE_CHANGE_C, SENSOR_HEARTBEAT_MS,
+        bmeTemperatureSent, force, sent
+    );
+    ok &= publishFloatFiltered(
+        MQTT_BME_HUMIDITY_TOPIC, reading.humidityPercent,
+        HUMIDITY_CHANGE_PERCENT, SENSOR_HEARTBEAT_MS,
+        bmeHumiditySent, force, sent
+    );
+    ok &= publishFloatFiltered(
+        MQTT_BME_PRESSURE_TOPIC, reading.pressureHpa,
+        PRESSURE_CHANGE_HPA, SENSOR_HEARTBEAT_MS,
+        bmePressureSent, force, sent
     );
 
-    ok &= mqttPublishFloat(
-        MQTT_BME_HUMIDITY_TOPIC,
-        reading.humidityPercent
-    );
-
-    ok &= mqttPublishFloat(
-        MQTT_BME_PRESSURE_TOPIC,
-        reading.pressureHpa
-    );
-
-    if (ok)
-    {
-        Serial.println(
-            "BME280 reading published to MQTT."
-        );
-    }
-    else
-    {
-        Serial.println(
-            "WARNING: BME280 MQTT publish failed."
-        );
-    }
+    if (!ok)
+        Serial.println("WARNING: BME280 MQTT publish failed.");
+    else if (sent)
+        Serial.println("BME280: changed/heartbeat values published.");
 }
 
 
 void publishXiaomiReading(
-    const XiaomiReading &reading
+    const XiaomiReading &reading,
+    bool force = false
 )
 {
     if (!mqttClient.connected())
-    {
         return;
-    }
 
     bool ok = true;
+    bool sent = false;
 
-    ok &= mqttPublishFloat(
-        MQTT_XIAOMI_TEMPERATURE_TOPIC,
-        reading.temperatureC
+    ok &= publishFloatFiltered(
+        MQTT_XIAOMI_TEMPERATURE_TOPIC, reading.temperatureC,
+        TEMPERATURE_CHANGE_C, SENSOR_HEARTBEAT_MS,
+        xiaomiTemperatureSent, force, sent
     );
-
-    ok &= mqttPublishFloat(
-        MQTT_XIAOMI_HUMIDITY_TOPIC,
-        reading.humidityPercent
+    ok &= publishFloatFiltered(
+        MQTT_XIAOMI_HUMIDITY_TOPIC, reading.humidityPercent,
+        HUMIDITY_CHANGE_PERCENT, SENSOR_HEARTBEAT_MS,
+        xiaomiHumiditySent, force, sent
     );
 
     if (reading.haveBattery)
     {
-        ok &= mqttPublishUInt(
-            MQTT_XIAOMI_BATTERY_TOPIC,
-            reading.batteryPercent
+        ok &= publishUIntFiltered(
+            MQTT_XIAOMI_BATTERY_TOPIC, reading.batteryPercent,
+            1.0, BATTERY_HEARTBEAT_MS,
+            xiaomiBatterySent, force, sent
         );
     }
 
     if (reading.haveBatteryVoltage)
     {
-        ok &= mqttPublishFloat(
-            MQTT_XIAOMI_BATTERY_VOLTAGE_TOPIC,
-            reading.batteryVoltage,
-            3
+        ok &= publishFloatFiltered(
+            MQTT_XIAOMI_BATTERY_VOLTAGE_TOPIC, reading.batteryVoltage,
+            BATTERY_VOLTAGE_CHANGE_V, BATTERY_HEARTBEAT_MS,
+            xiaomiBatteryVoltageSent, force, sent, 3
         );
     }
 
-    ok &= mqttPublishInt(
-        MQTT_XIAOMI_RSSI_TOPIC,
-        reading.rssi
+    // RSSI fluctuates constantly, so use a heartbeat only.
+    ok &= publishIntFiltered(
+        MQTT_XIAOMI_RSSI_TOPIC, reading.rssi,
+        0.0, SENSOR_HEARTBEAT_MS,
+        xiaomiRssiSent, force, sent
     );
 
-    if (ok)
+    if (!ok)
+        Serial.println("WARNING: Xiaomi MQTT publish failed.");
+    else if (sent)
     {
-        Serial.println(
-            "Xiaomi reading published to MQTT."
-        );
-    }
-    else
-    {
-        Serial.println(
-            "WARNING: Xiaomi MQTT publish failed."
-        );
+        // Show the latest complete Xiaomi reading only when at least one
+        // MQTT topic was actually published, not for every BLE packet.
+        // Each MQTT topic still uses its independent change/heartbeat filter.
+        Serial.println("Xiaomi: changed/heartbeat values published.");
+        printXiaomiReading(reading);
     }
 }
 
@@ -1044,8 +1157,6 @@ void processXiaomiQueue()
 
         if (newPacket)
         {
-            printXiaomiReading(reading);
-
             publishXiaomiReading(reading);
         }
     }
@@ -1082,6 +1193,46 @@ void maintainXiaomiAvailability()
 
         publishXiaomiAvailability();
     }
+}
+
+
+// =============================================================================
+// ARDUINO OTA: available after the initial USB flash
+// =============================================================================
+
+void startOta()
+{
+    if (otaStarted)
+        return;
+
+    // Require a non-empty password; never expose unauthenticated OTA.
+    if (OTA_PASSWORD[0] == '\0')
+    {
+        Serial.println("ERROR: OTA disabled (empty OTA_PASSWORD).");
+        return;
+    }
+
+    ArduinoOTA.setHostname(DEVICE_NAME);
+    ArduinoOTA.setPort(3232);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+
+    ArduinoOTA.onStart([]()
+    {
+        Serial.println("OTA firmware upload started.");
+    });
+    ArduinoOTA.onEnd([]()
+    {
+        Serial.println("OTA firmware upload finished; restarting.");
+    });
+    ArduinoOTA.onError([](ota_error_t error)
+    {
+        Serial.printf("OTA failed, error %u\n", static_cast<unsigned>(error));
+    });
+
+    ArduinoOTA.begin();
+    otaStarted = true;
+
+    Serial.printf("OTA enabled: %s.local:3232\n", DEVICE_NAME);
 }
 
 
@@ -1155,6 +1306,8 @@ void maintainWifi()
             Serial.println(
                 " dBm"
             );
+
+            startOta();
         }
 
         return;
@@ -1297,14 +1450,14 @@ bool connectMqtt()
     if (haveBmeReading)
     {
         publishBmeReading(
-            latestBmeReading
+            latestBmeReading, true
         );
     }
 
     if (haveXiaomiReading)
     {
         publishXiaomiReading(
-            latestXiaomiReading
+            latestXiaomiReading, true
         );
     }
 
@@ -1661,6 +1814,9 @@ void loop()
     // Network housekeeping
 
     maintainWifi();
+
+    if (otaStarted && WiFi.status() == WL_CONNECTED)
+        ArduinoOTA.handle();
 
     maintainMqtt();
 
