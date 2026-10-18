@@ -927,7 +927,13 @@ void publishXiaomiReading(
     if (!ok)
         Serial.println("WARNING: Xiaomi MQTT publish failed.");
     else if (sent)
+    {
+        // Show the latest complete Xiaomi reading only when at least one
+        // MQTT topic was actually published, not for every BLE packet.
+        // Each MQTT topic still uses its independent change/heartbeat filter.
         Serial.println("Xiaomi: changed/heartbeat values published.");
+        printXiaomiReading(reading);
+    }
 }
 
 
